@@ -524,7 +524,7 @@ def main(args):
         lr_scheduler.step()
     logging.info('[Main] Start training.')
 
-    profile.get_profiler(20, 25, profiler_type=args.profiler_type)
+    profile.set_profiler(20, 25, profiler_type=args.profiler_type)
     while True:
         # reset train log info
         if cur_step == 5:

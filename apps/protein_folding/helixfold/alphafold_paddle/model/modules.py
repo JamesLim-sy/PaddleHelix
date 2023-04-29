@@ -32,6 +32,8 @@ from alphafold_paddle.model.utils import init_gate_linear, init_final_linear
 
 from utils import profile
 
+use_fused_linear = True
+
 # Map head name in config to head name in model params
 Head_names = {
     'masked_msa': 'masked_msa_head',
@@ -157,6 +159,8 @@ class AlphaFold(nn.Layer):
 
         """
         profile.push_profile_event(self.__class__.__name__)
+        #print(f"-- batch['seq_mask'].dtype={batch['seq_mask'].dtype}")
+
         inner_batch, num_residues = batch['aatype'].shape[1:]
 
         def _get_prev(ret):
@@ -189,6 +193,8 @@ class AlphaFold(nn.Layer):
                 # (B, E, N, ...)
                 num_ensemble = inner_batch
                 ensembled_batch = batch
+
+            #print(f"-- ensembled_batch['seq_mask'].dtype={ensembled_batch['seq_mask'].dtype}")
 
             non_ensembled_batch = prev
             return self.alphafold_iteration(
@@ -286,6 +292,7 @@ class AlphaFoldIteration(nn.Layer):
                 self.channel_num, head_config, self.global_config)
 
             head_name_ = Head_names.get(head_name, head_name)
+            print(f"-- head_name={head_name_}")
             setattr(self, head_name_, module)
             self.heads.append(module)
 
@@ -492,9 +499,14 @@ class Attention(nn.Layer):
         if self.fuse_attention:
             if nonbatched_bias is not None:
                 nonbatched_bias = paddle.unsqueeze(nonbatched_bias, axis=1)
-            _, _, _, _, _, _, _, output = _C_ops.fused_gate_attention(
+
+            use_flash_attn = True
+            #use_flash_attn = False
+
+            _, _, _, _, _, _, _, _, output = _C_ops.fused_gate_attention(
                 q_data, m_data, self.query_w, self.key_w, self.value_w, self.qkv_w, nonbatched_bias, bias, self.gating_w, self.gating_b,
-                self.output_w, self.output_b, 'has_gating', self.config.gating, 'merge_qkv', self.merge_qkv)
+                self.output_w, self.output_b, 'has_gating', self.config.gating, 'merge_qkv', self.merge_qkv,
+                "use_flash_attn", use_flash_attn)
         else:
             c = self.key_dim ** (-0.5)
             q = paddle.einsum('nbqa,ahc->nbqhc', q_data, self.query_w) * c
@@ -779,8 +791,11 @@ class Transition(nn.Layer):
         elif transition_type == 'pair_transition':
             in_dim = channel_num['pair_channel']
 
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+
         self.input_layer_norm = nn.LayerNorm(in_dim)
-        self.transition1 = nn.Linear(
+        self.transition1 = Linear(
             in_dim, int(in_dim * self.config.num_intermediate_factor),
             weight_attr=paddle.ParamAttr(
                 initializer=nn.initializer.KaimingNormal()))
@@ -790,7 +805,7 @@ class Transition(nn.Layer):
         else:
             last_init = nn.initializer.TruncatedNormal()
 
-        self.transition2 = nn.Linear(
+        self.transition2 = Linear(
             int(in_dim * self.config.num_intermediate_factor), in_dim,
             weight_attr=paddle.ParamAttr(initializer=last_init))
 
@@ -829,7 +844,10 @@ class MaskedMsaHead(nn.Layer):
         self.config = config
         self.global_config = global_config
         self.num_output = config.num_output
-        self.logits = nn.Linear(channel_num['msa_channel'], self.num_output, name='logits')
+        
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+        self.logits = Linear(channel_num['msa_channel'], self.num_output, name='logits')
 
     def forward(self, representations, batch):
         """Builds MaskedMsaHead module.
@@ -872,14 +890,17 @@ class PredictedLDDTHead(nn.Layer):
         super(PredictedLDDTHead, self).__init__()
         self.config = config
         self.global_config = global_config
+    
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
 
         self.input_layer_norm = nn.LayerNorm(channel_num['seq_channel'],
                                              name='input_layer_norm')
-        self.act_0 = nn.Linear(channel_num['seq_channel'],
+        self.act_0  = Linear(channel_num['seq_channel'],
                                self.config.num_channels, name='act_0')
-        self.act_1 = nn.Linear(self.config.num_channels,
+        self.act_1  = Linear(self.config.num_channels,
                                self.config.num_channels, name='act_1')
-        self.logits = nn.Linear(self.config.num_channels,
+        self.logits = Linear(self.config.num_channels,
                                self.config.num_bins, name='logits')
 
     def forward(self, representations, batch):
@@ -963,7 +984,10 @@ class PredictedAlignedErrorHead(nn.Layer):
         self.config = config
         self.global_config = global_config
 
-        self.logits = nn.Linear(channel_num['pair_channel'],
+
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+        self.logits = Linear(channel_num['pair_channel'],
                                 self.config.num_bins, name='logits')
 
     def forward(self, representations, batch):
@@ -1054,7 +1078,10 @@ class ExperimentallyResolvedHead(nn.Layer):
         super(ExperimentallyResolvedHead, self).__init__()
         self.config = config
         self.global_config = global_config
-        self.logits = nn.Linear(channel_num['seq_channel'], 37, name='logits')
+        
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+        self.logits = Linear(channel_num['seq_channel'], 37, name='logits')
 
     def forward(self, representations, batch):
         """Builds ExperimentallyResolvedHead module.
@@ -1111,7 +1138,9 @@ class DistogramHead(nn.Layer):
         self.config = config
         # self.global_config = global_config
 
-        self.half_logits = nn.Linear(channel_num['pair_channel'],
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+        self.half_logits = Linear(channel_num['pair_channel'],
                                     self.config.num_bins, name='half_logits')
         init_final_linear(self.half_logits)
 
@@ -1507,30 +1536,32 @@ class EmbeddingsAndEvoformer(nn.Layer):
         self.config = config
         self.global_config = global_config
 
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
         # InputEmbedder
         # Jumper et al. (2021) Suppl. Alg. 2 "Inference" line 5
         # Jumper et al. (2021) Suppl. Alg. 3 "InputEmbedder"
-        self.preprocess_1d = nn.Linear(channel_num['target_feat'],
+        self.preprocess_1d = Linear(channel_num['target_feat'],
                                        self.config.msa_channel, name='preprocess_1d')
-        self.preprocess_msa = nn.Linear(channel_num['msa_feat'],
+        self.preprocess_msa = Linear(channel_num['msa_feat'],
                                         self.config.msa_channel, name='preprocess_msa')
-        self.left_single = nn.Linear(channel_num['target_feat'], self.config.pair_channel,
+        self.left_single = Linear(channel_num['target_feat'], self.config.pair_channel,
                                      name='left_single')
-        self.right_single = nn.Linear(channel_num['target_feat'], self.config.pair_channel,
+        self.right_single = Linear(channel_num['target_feat'], self.config.pair_channel,
                                       name='right_single')
 
         # RecyclingEmbedder
         # Jumper et al. (2021) Suppl. Alg. 2 "Inference" line 6
         # Jumper et al. (2021) Suppl. Alg. 32 "RecyclingEmbedder"
         if self.config.recycle_pos:
-            self.prev_pos_linear = nn.Linear(self.config.prev_pos.num_bins,
+            self.prev_pos_linear = Linear(self.config.prev_pos.num_bins,
                                              self.config.pair_channel)
 
         # RelPosEmbedder
         # Jumper et al. (2021) Suppl. Alg. 4 "relpos"
         # Jumper et al. (2021) Suppl. Alg. 5 "one_hot"
         if self.config.max_relative_feature:
-            self.pair_activiations = nn.Linear(
+            self.pair_activiations = Linear(
                 2 * self.config.max_relative_feature + 1,
                 self.config.pair_channel)
 
@@ -1549,7 +1580,7 @@ class EmbeddingsAndEvoformer(nn.Layer):
 
         # ExtraMSAEmbedder
         # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 14-16
-        self.extra_msa_activations = nn.Linear(
+        self.extra_msa_activations = Linear(
             25,  # 23 (20aa+unknown+gap+mask) + 1 (has_del) + 1 (del_val)
             self.config.extra_msa_channel)
 
@@ -1564,9 +1595,9 @@ class EmbeddingsAndEvoformer(nn.Layer):
         # Embed templates torsion angles
         if self.config.template.enabled and self.config.template.embed_torsion_angles:
             c = self.config.msa_channel
-            self.template_single_embedding = nn.Linear(
+            self.template_single_embedding = Linear(
                 self.channel_num['template_angle'], c)
-            self.template_projection = nn.Linear(c, c)
+            self.template_projection = Linear(c, c)
 
         # Main trunk of the network
         # Jumper et al. (2021) Suppl. Alg. 2 "Inference" lines 17-18
@@ -1576,7 +1607,7 @@ class EmbeddingsAndEvoformer(nn.Layer):
                 self.channel_num, self.config.evoformer, self.global_config,
                 is_extra_msa=False))
 
-        self.single_activations = nn.Linear(
+        self.single_activations = Linear(
             self.config.msa_channel, self.config.seq_channel)
 
     def _pseudo_beta_fn(self, aatype, all_atom_positions, all_atom_masks):
@@ -1822,10 +1853,13 @@ class OuterProductMean(nn.Layer):
         else:
             c_m = channel_num['msa_channel']
 
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+
         self.layer_norm_input = nn.LayerNorm(c_m, name='layer_norm_input')
-        self.left_projection = nn.Linear(
+        self.left_projection = Linear(
             c_m, self.config.num_outer_channel, name='left_projection')
-        self.right_projection = nn.Linear(
+        self.right_projection = Linear(
             c_m, self.config.num_outer_channel, name='right_projection')
 
         if self.global_config.zero_init:
@@ -1969,25 +2003,28 @@ class TriangleMultiplication(nn.Layer):
         self.config = config
         self.global_config = global_config
 
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+
         self.layer_norm_input = nn.LayerNorm(self.channel_num['pair_channel'], name='layer_norm_input')
-        self.left_projection = nn.Linear(self.channel_num['pair_channel'],
+        self.left_projection = Linear(self.channel_num['pair_channel'],
                                 self.config.num_intermediate_channel, name='left_projection')
-        self.right_projection = nn.Linear(self.channel_num['pair_channel'],
+        self.right_projection = Linear(self.channel_num['pair_channel'],
                                 self.config.num_intermediate_channel, name='right_projection')
-        self.left_gate = nn.Linear(self.channel_num['pair_channel'],
+        self.left_gate = Linear(self.channel_num['pair_channel'],
                                 self.config.num_intermediate_channel, name='left_gate')
         init_gate_linear(self.left_gate)
-        self.right_gate = nn.Linear(self.channel_num['pair_channel'],
+        self.right_gate = Linear(self.channel_num['pair_channel'],
                                 self.config.num_intermediate_channel, name='right_gate')
         init_gate_linear(self.right_gate)
 
         # line 4
         self.center_layer_norm = nn.LayerNorm(self.config.num_intermediate_channel, name='center_layer_norm')
-        self.output_projection = nn.Linear(self.config.num_intermediate_channel,
+        self.output_projection = Linear(self.config.num_intermediate_channel,
                                     self.channel_num['pair_channel'], name='output_projection')
         init_final_linear(self.output_projection)
         # line 3
-        self.gating_linear = nn.Linear(self.channel_num['pair_channel'],
+        self.gating_linear = Linear(self.channel_num['pair_channel'],
                                     self.channel_num['pair_channel'], name='output_projection')
         init_gate_linear(self.gating_linear)
 
@@ -2173,7 +2210,9 @@ class SingleTemplateEmbedding(nn.Layer):
         self.channel_num = channel_num
         self.global_config = global_config
 
-        self.embedding2d = nn.Linear(channel_num['template_pair'],
+        global use_fused_linear
+        Linear = paddle.incubate.nn.FusedLinear if use_fused_linear else nn.Linear
+        self.embedding2d = Linear(channel_num['template_pair'],
             self.config.template_pair_stack.triangle_attention_ending_node.value_dim)
 
         self.template_pair_stack = nn.LayerList()
